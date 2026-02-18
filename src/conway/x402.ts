@@ -24,6 +24,7 @@ const CHAINS: Record<string, any> = {
   "eip155:8453": base,
   "eip155:84532": baseSepolia,
 };
+type NetworkId = keyof typeof USDC_ADDRESSES;
 
 const BALANCE_OF_ABI = [
   {
@@ -37,17 +38,146 @@ const BALANCE_OF_ABI = [
 
 interface PaymentRequirement {
   scheme: string;
-  network: string;
+  network: NetworkId;
   maxAmountRequired: string;
   payToAddress: Address;
   requiredDeadlineSeconds: number;
   usdcAddress: Address;
 }
 
+interface PaymentRequiredResponse {
+  x402Version: number;
+  accepts: PaymentRequirement[];
+}
+
+interface ParsedPaymentRequirement {
+  x402Version: number;
+  requirement: PaymentRequirement;
+}
+
 interface X402PaymentResult {
   success: boolean;
   response?: any;
   error?: string;
+  status?: number;
+}
+
+export interface UsdcBalanceResult {
+  balance: number;
+  network: string;
+  ok: boolean;
+  error?: string;
+}
+
+function safeJsonParse(value: string): unknown | null {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function parsePositiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return null;
+}
+
+function normalizeNetwork(raw: unknown): NetworkId | null {
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "base") return "eip155:8453";
+  if (normalized === "base-sepolia") return "eip155:84532";
+  if (normalized === "eip155:8453" || normalized === "eip155:84532") {
+    return normalized;
+  }
+  return null;
+}
+
+function normalizePaymentRequirement(raw: unknown): PaymentRequirement | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const value = raw as Record<string, unknown>;
+  const network = normalizeNetwork(value.network);
+  if (!network) return null;
+
+  const scheme = typeof value.scheme === "string" ? value.scheme : null;
+  const maxAmountRequired = typeof value.maxAmountRequired === "string"
+    ? value.maxAmountRequired
+    : typeof value.maxAmountRequired === "number" &&
+        Number.isFinite(value.maxAmountRequired)
+      ? String(value.maxAmountRequired)
+      : null;
+  const payToAddress = typeof value.payToAddress === "string"
+    ? value.payToAddress
+    : typeof value.payTo === "string"
+      ? value.payTo
+      : null;
+  const usdcAddress = typeof value.usdcAddress === "string"
+    ? value.usdcAddress
+    : typeof value.asset === "string"
+      ? value.asset
+      : USDC_ADDRESSES[network];
+  const requiredDeadlineSeconds =
+    parsePositiveInt(value.requiredDeadlineSeconds) ??
+    parsePositiveInt(value.maxTimeoutSeconds) ??
+    300;
+
+  if (!scheme || !maxAmountRequired || !payToAddress || !usdcAddress) {
+    return null;
+  }
+
+  return {
+    scheme,
+    network,
+    maxAmountRequired,
+    payToAddress: payToAddress as Address,
+    requiredDeadlineSeconds,
+    usdcAddress: usdcAddress as Address,
+  };
+}
+
+function normalizePaymentRequired(raw: unknown): PaymentRequiredResponse | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const value = raw as Record<string, unknown>;
+  if (!Array.isArray(value.accepts)) return null;
+
+  const accepts = value.accepts
+    .map(normalizePaymentRequirement)
+    .filter((v): v is PaymentRequirement => v !== null);
+  if (!accepts.length) return null;
+
+  const x402Version = parsePositiveInt(value.x402Version) ?? 1;
+  return { x402Version, accepts };
+}
+
+function parseMaxAmountRequired(maxAmountRequired: string, x402Version: number): bigint {
+  const amount = maxAmountRequired.trim();
+  if (!/^\d+(\.\d+)?$/.test(amount)) {
+    throw new Error(`Invalid maxAmountRequired: ${maxAmountRequired}`);
+  }
+
+  if (amount.includes(".")) {
+    return parseUnits(amount, 6);
+  }
+  if (x402Version >= 2 || amount.length > 6) {
+    return BigInt(amount);
+  }
+  return parseUnits(amount, 6);
+}
+
+function selectRequirement(parsed: PaymentRequiredResponse): PaymentRequirement {
+  const exactSupported = parsed.accepts.find(
+    (r) => r.scheme === "exact" && !!CHAINS[r.network],
+  );
+  if (exactSupported) return exactSupported;
+  return parsed.accepts[0];
 }
 
 /**
@@ -57,10 +187,26 @@ export async function getUsdcBalance(
   address: Address,
   network: string = "eip155:8453",
 ): Promise<number> {
+  const result = await getUsdcBalanceDetailed(address, network);
+  return result.balance;
+}
+
+/**
+ * Get the USDC balance and read status details for diagnostics.
+ */
+export async function getUsdcBalanceDetailed(
+  address: Address,
+  network: string = "eip155:8453",
+): Promise<UsdcBalanceResult> {
   const chain = CHAINS[network];
   const usdcAddress = USDC_ADDRESSES[network];
   if (!chain || !usdcAddress) {
-    return 0;
+    return {
+      balance: 0,
+      network,
+      ok: false,
+      error: `Unsupported USDC network: ${network}`,
+    };
   }
 
   try {
@@ -77,9 +223,18 @@ export async function getUsdcBalance(
     });
 
     // USDC has 6 decimals
-    return Number(balance) / 1_000_000;
-  } catch {
-    return 0;
+    return {
+      balance: Number(balance) / 1_000_000,
+      network,
+      ok: true,
+    };
+  } catch (err: any) {
+    return {
+      balance: 0,
+      network,
+      ok: false,
+      error: err?.message || String(err),
+    };
   }
 }
 
@@ -94,47 +249,8 @@ export async function checkX402(
     if (resp.status !== 402) {
       return null;
     }
-
-    // Try X-Payment-Required header
-    const header = resp.headers.get("X-Payment-Required");
-    if (header) {
-      const requirements = JSON.parse(
-        Buffer.from(header, "base64").toString("utf-8"),
-      );
-      const accept = requirements.accepts?.[0];
-      if (accept) {
-        return {
-          scheme: accept.scheme,
-          network: accept.network,
-          maxAmountRequired: accept.maxAmountRequired,
-          payToAddress: accept.payToAddress,
-          requiredDeadlineSeconds: accept.requiredDeadlineSeconds || 300,
-          usdcAddress:
-            accept.usdcAddress ||
-            USDC_ADDRESSES[accept.network] ||
-            USDC_ADDRESSES["eip155:8453"],
-        };
-      }
-    }
-
-    // Try body
-    const body = await resp.json().catch(() => null);
-    if (body?.accepts?.[0]) {
-      const accept = body.accepts[0];
-      return {
-        scheme: accept.scheme,
-        network: accept.network,
-        maxAmountRequired: accept.maxAmountRequired,
-        payToAddress: accept.payToAddress,
-        requiredDeadlineSeconds: accept.requiredDeadlineSeconds || 300,
-        usdcAddress:
-          accept.usdcAddress ||
-          USDC_ADDRESSES[accept.network] ||
-          USDC_ADDRESSES["eip155:8453"],
-      };
-    }
-
-    return null;
+    const parsed = await parsePaymentRequired(resp);
+    return parsed?.requirement ?? null;
   } catch {
     return null;
   }
@@ -163,19 +279,33 @@ export async function x402Fetch(
       const data = await initialResp
         .json()
         .catch(() => initialResp.text());
-      return { success: initialResp.ok, response: data };
+      return { success: initialResp.ok, response: data, status: initialResp.status };
     }
 
     // Parse payment requirements
-    const requirement = await parsePaymentRequired(initialResp);
-    if (!requirement) {
-      return { success: false, error: "Could not parse payment requirements" };
+    const parsed = await parsePaymentRequired(initialResp);
+    if (!parsed) {
+      return {
+        success: false,
+        error: "Could not parse payment requirements",
+        status: initialResp.status,
+      };
     }
 
     // Sign payment
-    const payment = await signPayment(account, requirement);
-    if (!payment) {
-      return { success: false, error: "Failed to sign payment" };
+    let payment: any;
+    try {
+      payment = await signPayment(
+        account,
+        parsed.requirement,
+        parsed.x402Version,
+      );
+    } catch (err: any) {
+      return {
+        success: false,
+        error: `Failed to sign payment: ${err?.message || String(err)}`,
+        status: initialResp.status,
+      };
     }
 
     // Retry with payment
@@ -194,7 +324,7 @@ export async function x402Fetch(
     });
 
     const data = await paidResp.json().catch(() => paidResp.text());
-    return { success: paidResp.ok, response: data };
+    return { success: paidResp.ok, response: data, status: paidResp.status };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -202,21 +332,40 @@ export async function x402Fetch(
 
 async function parsePaymentRequired(
   resp: Response,
-): Promise<PaymentRequirement | null> {
+): Promise<ParsedPaymentRequirement | null> {
   const header = resp.headers.get("X-Payment-Required");
   if (header) {
+    const rawHeader = safeJsonParse(header);
+    const normalizedRaw = normalizePaymentRequired(rawHeader);
+    if (normalizedRaw) {
+      return {
+        x402Version: normalizedRaw.x402Version,
+        requirement: selectRequirement(normalizedRaw),
+      };
+    }
+
     try {
-      const requirements = JSON.parse(
-        Buffer.from(header, "base64").toString("utf-8"),
-      );
-      const accept = requirements.accepts?.[0];
-      if (accept) return accept;
-    } catch {}
+      const decoded = Buffer.from(header, "base64").toString("utf-8");
+      const parsedDecoded = normalizePaymentRequired(safeJsonParse(decoded));
+      if (parsedDecoded) {
+        return {
+          x402Version: parsedDecoded.x402Version,
+          requirement: selectRequirement(parsedDecoded),
+        };
+      }
+    } catch {
+      // Ignore header decode errors and continue with body parsing.
+    }
   }
 
   try {
     const body = await resp.json();
-    return body.accepts?.[0] || null;
+    const parsedBody = normalizePaymentRequired(body);
+    if (!parsedBody) return null;
+    return {
+      x402Version: parsedBody.x402Version,
+      requirement: selectRequirement(parsedBody),
+    };
   } catch {
     return null;
   }
@@ -225,70 +374,74 @@ async function parsePaymentRequired(
 async function signPayment(
   account: PrivateKeyAccount,
   requirement: PaymentRequirement,
-): Promise<any | null> {
-  try {
-    const nonce = `0x${Buffer.from(
-      crypto.getRandomValues(new Uint8Array(32)),
-    ).toString("hex")}`;
-
-    const now = Math.floor(Date.now() / 1000);
-    const validAfter = now - 60;
-    const validBefore = now + requirement.requiredDeadlineSeconds;
-
-    const amount = parseUnits(requirement.maxAmountRequired, 6);
-
-    // EIP-712 typed data for TransferWithAuthorization
-    const domain = {
-      name: "USD Coin",
-      version: "2",
-      chainId: requirement.network === "eip155:84532" ? 84532 : 8453,
-      verifyingContract: requirement.usdcAddress,
-    } as const;
-
-    const types = {
-      TransferWithAuthorization: [
-        { name: "from", type: "address" },
-        { name: "to", type: "address" },
-        { name: "value", type: "uint256" },
-        { name: "validAfter", type: "uint256" },
-        { name: "validBefore", type: "uint256" },
-        { name: "nonce", type: "bytes32" },
-      ],
-    } as const;
-
-    const message = {
-      from: account.address,
-      to: requirement.payToAddress,
-      value: amount,
-      validAfter: BigInt(validAfter),
-      validBefore: BigInt(validBefore),
-      nonce: nonce as `0x${string}`,
-    };
-
-    const signature = await account.signTypedData({
-      domain,
-      types,
-      primaryType: "TransferWithAuthorization",
-      message,
-    });
-
-    return {
-      x402Version: 1,
-      scheme: "exact",
-      network: requirement.network,
-      payload: {
-        signature,
-        authorization: {
-          from: account.address,
-          to: requirement.payToAddress,
-          value: amount.toString(),
-          validAfter: validAfter.toString(),
-          validBefore: validBefore.toString(),
-          nonce,
-        },
-      },
-    };
-  } catch {
-    return null;
+  x402Version: number,
+): Promise<any> {
+  const chain = CHAINS[requirement.network];
+  if (!chain) {
+    throw new Error(`Unsupported network: ${requirement.network}`);
   }
+
+  const nonce = `0x${Buffer.from(
+    crypto.getRandomValues(new Uint8Array(32)),
+  ).toString("hex")}`;
+
+  const now = Math.floor(Date.now() / 1000);
+  const validAfter = now - 60;
+  const validBefore = now + requirement.requiredDeadlineSeconds;
+  const amount = parseMaxAmountRequired(
+    requirement.maxAmountRequired,
+    x402Version,
+  );
+
+  // EIP-712 typed data for TransferWithAuthorization
+  const domain = {
+    name: "USD Coin",
+    version: "2",
+    chainId: chain.id,
+    verifyingContract: requirement.usdcAddress,
+  } as const;
+
+  const types = {
+    TransferWithAuthorization: [
+      { name: "from", type: "address" },
+      { name: "to", type: "address" },
+      { name: "value", type: "uint256" },
+      { name: "validAfter", type: "uint256" },
+      { name: "validBefore", type: "uint256" },
+      { name: "nonce", type: "bytes32" },
+    ],
+  } as const;
+
+  const message = {
+    from: account.address,
+    to: requirement.payToAddress,
+    value: amount,
+    validAfter: BigInt(validAfter),
+    validBefore: BigInt(validBefore),
+    nonce: nonce as `0x${string}`,
+  };
+
+  const signature = await account.signTypedData({
+    domain,
+    types,
+    primaryType: "TransferWithAuthorization",
+    message,
+  });
+
+  return {
+    x402Version,
+    scheme: requirement.scheme,
+    network: requirement.network,
+    payload: {
+      signature,
+      authorization: {
+        from: account.address,
+        to: requirement.payToAddress,
+        value: amount.toString(),
+        validAfter: validAfter.toString(),
+        validBefore: validBefore.toString(),
+        nonce,
+      },
+    },
+  };
 }
