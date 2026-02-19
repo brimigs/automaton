@@ -1252,7 +1252,7 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           to_address: {
             type: "string",
-            description: "Recipient wallet address (0x...)",
+            description: "Recipient wallet address (base58)",
           },
           content: {
             type: "string",

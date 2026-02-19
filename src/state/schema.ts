@@ -141,7 +141,7 @@ export const CREATE_TABLES = `
     to_agent TEXT NOT NULL,
     score INTEGER NOT NULL,
     comment TEXT NOT NULL DEFAULT '',
-    tx_hash TEXT,
+    tx_signature TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -223,7 +223,7 @@ export const MIGRATION_V2 = `
     to_agent TEXT NOT NULL,
     score INTEGER NOT NULL,
     comment TEXT NOT NULL DEFAULT '',
-    tx_hash TEXT,
+    tx_signature TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 

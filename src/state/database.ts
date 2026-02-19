@@ -382,7 +382,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   const insertReputation = (entry: ReputationEntry): void => {
     db.prepare(
-      `INSERT INTO reputation (id, from_agent, to_agent, score, comment, tx_hash)
+      `INSERT INTO reputation (id, from_agent, to_agent, score, comment, tx_signature)
        VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(
       entry.id,
@@ -390,7 +390,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
       entry.toAgent,
       entry.score,
       entry.comment,
-      entry.txHash ?? null,
+      entry.txSignature ?? null,
     );
   };
 
@@ -623,7 +623,7 @@ function deserializeReputation(row: any): ReputationEntry {
     toAgent: row.to_agent,
     score: row.score,
     comment: row.comment,
-    txHash: row.tx_hash ?? undefined,
+    txSignature: row.tx_signature ?? undefined,
     timestamp: row.created_at,
   };
 }

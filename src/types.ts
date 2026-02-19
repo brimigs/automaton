@@ -606,7 +606,7 @@ export interface ReputationEntry {
   toAgent: string;
   score: number;
   comment: string;
-  txHash?: string;
+  txSignature?: string;
   timestamp: string;
 }
 
