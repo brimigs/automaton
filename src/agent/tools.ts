@@ -773,13 +773,16 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { transferUsdc } = await import("../solana/usdc.js");
+        const { createKoraClient } = await import("../solana/kora.js");
         const network = (ctx.config.solanaNetwork || "mainnet-beta") as "mainnet-beta" | "devnet" | "testnet";
+        const koraClient = createKoraClient(ctx.config.koraRpcUrl);
         const result = await transferUsdc(
           ctx.identity.account,
           args.to_address as string,
           args.amount as number,
           network,
           ctx.config.solanaRpcUrl,
+          koraClient,
         );
 
         if (!result.success) {
@@ -1116,7 +1119,9 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { registerAgent } = await import("../registry/solana-registry.js");
+        const { createKoraClient } = await import("../solana/kora.js");
         const network = ((args.network as string) || "mainnet-beta") as "mainnet-beta" | "devnet" | "testnet";
+        const koraClient = createKoraClient(ctx.config.koraRpcUrl);
         const entry = await registerAgent(
           ctx.identity.account,
           ctx.identity.name,
@@ -1124,6 +1129,7 @@ Model: ${ctx.inference.getDefaultModel()}
           network,
           ctx.config.solanaRpcUrl,
           ctx.db,
+          koraClient,
         );
         return `Registered on-chain! Asset: ${entry.assetAddress}, TX: ${entry.txSignature}`;
       },
@@ -1181,7 +1187,9 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { leaveFeedback } = await import("../registry/solana-registry.js");
+        const { createKoraClient } = await import("../solana/kora.js");
         const network = (ctx.config.solanaNetwork || "mainnet-beta") as "mainnet-beta" | "devnet" | "testnet";
+        const koraClient = createKoraClient(ctx.config.koraRpcUrl);
         const sig = await leaveFeedback(
           ctx.identity.account,
           args.asset_address as string,
@@ -1190,6 +1198,7 @@ Model: ${ctx.inference.getDefaultModel()}
           network,
           ctx.config.solanaRpcUrl,
           ctx.db,
+          koraClient,
         );
         return `Feedback submitted. TX: ${sig}`;
       },
@@ -1559,6 +1568,8 @@ Model: ${ctx.inference.getDefaultModel()}
           ? JSON.parse(args.headers as string)
           : undefined;
 
+        const { createKoraClient } = await import("../solana/kora.js");
+        const koraClient = createKoraClient(ctx.config.koraRpcUrl);
         const result = await x402Fetch(
           url,
           ctx.identity.account,
@@ -1566,6 +1577,7 @@ Model: ${ctx.inference.getDefaultModel()}
           body,
           extraHeaders,
           ctx.config.solanaRpcUrl,
+          koraClient,
         );
 
         if (!result.success) {

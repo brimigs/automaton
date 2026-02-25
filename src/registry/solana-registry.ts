@@ -5,6 +5,11 @@
  * Each agent gets a unique NFT asset as its verifiable on-chain identity.
  *
  * Uses Metaplex Core (mpl-core) — not Token Metadata.
+ *
+ * Kora integration:
+ *   When a KoraClient is provided, a custom umi RPC adapter routes all
+ *   sendTransaction calls through Kora's fee-abstraction service.
+ *   This allows NFT creation, updates, and memos without any SOL.
  */
 
 import { createHash } from "crypto";
@@ -13,6 +18,7 @@ import {
   PublicKey,
   Connection,
   Transaction,
+  VersionedTransaction,
   TransactionInstruction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
@@ -30,8 +36,10 @@ import {
   keypairIdentity,
   publicKey as umiPublicKey,
   type Umi,
+  type UmiPlugin,
 } from "@metaplex-foundation/umi";
 import type { RegistryEntry, DiscoveredAgent, AutomatonDatabase } from "../types.js";
+import type { KoraClient } from "../solana/kora.js";
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
@@ -47,6 +55,8 @@ const RPC_URLS: Record<SolanaNetwork, string> = {
   testnet: "https://api.testnet.solana.com",
 };
 
+// ─── Umi Factory ───────────────────────────────────────────────
+
 function createUmiInstance(keypair: Keypair, rpcUrl: string): Umi {
   const umi = createUmi(rpcUrl).use(mplCore());
   const umiKp = {
@@ -56,6 +66,43 @@ function createUmiInstance(keypair: Keypair, rpcUrl: string): Umi {
   umi.use(keypairIdentity(umiKp));
   return umi;
 }
+
+/**
+ * Create a Kora-aware umi plugin that overrides the RPC sendTransaction method
+ * to route through Kora's fee-abstraction service.
+ *
+ * Transactions built by umi will have the user as identity/signer. When sent,
+ * Kora adds its fee payer signature and broadcasts. Zero SOL required.
+ */
+function koraRpcPlugin(
+  kora: KoraClient,
+  keypair: Keypair,
+): UmiPlugin {
+  return {
+    install(umi) {
+      const originalRpc = umi.rpc;
+
+      // Override sendTransaction to route through Kora
+      umi.rpc = {
+        ...originalRpc,
+        sendTransaction: async (transaction, options) => {
+          // Serialize the umi transaction to bytes
+          const txBytes = umi.transactions.serialize(transaction);
+          const txBase64 = Buffer.from(txBytes).toString("base64");
+
+          // The transaction is already signed by user's keypair (via keypairIdentity).
+          // Send to Kora: it adds its fee payer signature and broadcasts.
+          const result = await kora.signAndSendTransaction(txBase64);
+
+          // Return the signature as Uint8Array (umi expects this format)
+          return bs58.decode(result.signature);
+        },
+      } as typeof originalRpc;
+    },
+  };
+}
+
+// ─── Helpers ───────────────────────────────────────────────────
 
 function isIdempotencyError(err: unknown): boolean {
   const msg = String(err).toLowerCase();
@@ -71,9 +118,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ─── Public API ────────────────────────────────────────────────
+
 /**
  * Register the automaton on-chain as a Metaplex Core NFT.
  * Returns the registry entry with the NFT asset address.
+ *
+ * When koraClient is provided, zero SOL is required.
  */
 export async function registerAgent(
   keypair: Keypair,
@@ -82,9 +133,15 @@ export async function registerAgent(
   network: SolanaNetwork = "mainnet-beta",
   rpcUrl: string | undefined,
   db: AutomatonDatabase,
+  koraClient?: KoraClient | null,
 ): Promise<RegistryEntry> {
   const rpc = rpcUrl || RPC_URLS[network];
   const umi = createUmiInstance(keypair, rpc);
+
+  // Inject Kora RPC adapter if configured
+  if (koraClient) {
+    umi.use(koraRpcPlugin(koraClient, keypair));
+  }
 
   // Check if already registered (idempotency via DB)
   const existing = db.getRegistryEntry();
@@ -158,6 +215,8 @@ export async function registerAgent(
 
 /**
  * Update the agent's URI on-chain (e.g. when agent card changes).
+ *
+ * When koraClient is provided, zero SOL is required.
  */
 export async function updateAgentURI(
   keypair: Keypair,
@@ -166,9 +225,15 @@ export async function updateAgentURI(
   network: SolanaNetwork = "mainnet-beta",
   rpcUrl: string | undefined,
   db: AutomatonDatabase,
+  koraClient?: KoraClient | null,
 ): Promise<string> {
   const rpc = rpcUrl || RPC_URLS[network];
   const umi = createUmiInstance(keypair, rpc);
+
+  // Inject Kora RPC adapter if configured
+  if (koraClient) {
+    umi.use(koraRpcPlugin(koraClient, keypair));
+  }
 
   const { signature } = await updateV1(umi, {
     asset: umiPublicKey(assetAddress),
@@ -189,6 +254,8 @@ export async function updateAgentURI(
 
 /**
  * Record reputation feedback on-chain via Solana Memo program.
+ *
+ * When koraClient is provided, zero SOL is required — fees paid in USDC.
  */
 export async function leaveFeedback(
   keypair: Keypair,
@@ -198,9 +265,9 @@ export async function leaveFeedback(
   network: SolanaNetwork = "mainnet-beta",
   rpcUrl: string | undefined,
   _db: AutomatonDatabase,
+  koraClient?: KoraClient | null,
 ): Promise<string> {
   const rpc = rpcUrl || RPC_URLS[network];
-  const connection = new Connection(rpc, "confirmed");
 
   const feedbackPayload = JSON.stringify({
     type: "agent-feedback",
@@ -217,6 +284,30 @@ export async function leaveFeedback(
     data: Buffer.from(feedbackPayload, "utf-8"),
   });
 
+  // ── Kora path: fees in USDC ──────────────────────────────
+  if (koraClient) {
+    const { blockhash, lastValidBlockHeight } = await new Connection(rpc, "confirmed")
+      .getLatestBlockhash();
+
+    const tx = new Transaction({
+      feePayer: keypair.publicKey,  // Placeholder; Kora will override as fee payer
+      blockhash,
+      lastValidBlockHeight,
+    }).add(memoIx);
+
+    // Partially sign (user authorizes the memo)
+    tx.partialSign(keypair);
+    const partiallySignedBase64 = tx
+      .serialize({ requireAllSignatures: false })
+      .toString("base64");
+
+    // Kora adds fee payer signature and broadcasts
+    const result = await koraClient.signAndSendTransaction(partiallySignedBase64);
+    return result.signature;
+  }
+
+  // ── Fallback: direct transaction (requires SOL) ──────────
+  const connection = new Connection(rpc, "confirmed");
   const tx = new Transaction().add(memoIx);
   const txSig = await sendAndConfirmTransaction(connection, tx, [keypair]);
   return txSig;

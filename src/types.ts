@@ -56,6 +56,7 @@ export interface AutomatonConfig {
   socialRelayUrl?: string;
   solanaRpcUrl?: string; // Solana RPC endpoint
   solanaNetwork?: "mainnet-beta" | "devnet" | "testnet";
+  koraRpcUrl?: string; // Kora fee-abstraction RPC URL (enables USDC fee payment, no SOL required)
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {

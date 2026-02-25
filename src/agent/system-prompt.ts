@@ -225,6 +225,7 @@ Total turns completed: ${turnCount}
 Recent self-modifications: ${recentMods.length}
 Inference model: ${config.inferenceModel}
 Solana NFT Asset: ${registryEntry?.assetAddress || "not registered"}
+Kora (fee abstraction): ${config.koraRpcUrl ? `configured (${config.koraRpcUrl}) — fees paid in USDC, no SOL required` : "not configured — SOL required for Solana tx fees"}
 Children: ${children.filter((c) => c.status !== "dead").length} alive / ${children.length} total
 Lineage: ${lineageSummary}${upstreamLine}
 --- END STATUS ---`,
